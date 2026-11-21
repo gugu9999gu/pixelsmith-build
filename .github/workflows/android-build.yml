@@ -1,0 +1,243 @@
+name: Sealed Android build
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: sealed-android-build
+  cancel-in-progress: false
+
+jobs:
+  android:
+    if: github.ref == 'refs/heads/main' && github.actor == github.repository_owner
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    environment: sealed-build
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Authenticate and extract candidate
+        id: source
+        env:
+          SEALED_SOURCE_KEY: ${{ secrets.SEALED_SOURCE_KEY }}
+        run: |
+          umask 077
+          mkdir -p "$RUNNER_TEMP/private-output/logs" "$RUNNER_TEMP/candidate-home"
+          test -n "$SEALED_SOURCE_KEY"
+          payload_url="$(node sealed.cjs source-url source-plan.json)"
+          env -u SEALED_SOURCE_KEY curl --fail --silent --show-error --location \
+            --proto '=https' --proto-redir '=https' --max-redirs 5 --max-time 180 \
+            --max-filesize 1073741824 --output "$RUNNER_TEMP/source.sealed" -- "$payload_url" \
+            > "$RUNNER_TEMP/private-output/logs/download.log" 2>&1
+          node sealed.cjs decrypt-input source-plan.json "$RUNNER_TEMP/source.sealed" "$RUNNER_TEMP/candidate"
+          unset SEALED_SOURCE_KEY
+          expected="$(node -p "require('./source-plan.json').commit")"
+          if ! bash -euo pipefail -s -- "$RUNNER_TEMP/candidate" "$RUNNER_TEMP/candidate-home" "$expected" \
+            > "$RUNNER_TEMP/private-output/logs/source-revision.log" 2>&1 <<'BASH'
+          cd "$1"
+          test -d .git
+          test -f .git/config
+          test ! -e .git/commondir
+          test ! -e .git/objects/info/alternates
+          test ! -e .git/objects/info/http-alternates
+          candidate_home="$2"
+          git_local() {
+            env -i PATH="$PATH" HOME="$candidate_home" GIT_CONFIG_NOSYSTEM=1 \
+              git -c core.hooksPath=/dev/null -c core.fsmonitor=false "$@"
+          }
+          local_keys="$(git_local config --local --no-includes --name-only --list)"
+          if test -n "$local_keys"; then
+            test -z "$(printf '%s\n' "$local_keys" | awk '!/^core\.(repositoryformatversion|filemode|bare|logallrefupdates|ignorecase|precomposeunicode)$/')"
+          fi
+          root="$(git_local rev-parse --show-toplevel)"
+          current="$(git_local rev-parse HEAD)"
+          shallow="$(git_local rev-parse --is-shallow-repository)"
+          revisions="$(git_local rev-list --all --count)"
+          remotes="$(git_local remote)"
+          changes="$(git_local status --porcelain --untracked-files=all)"
+          extras="$(git_local clean -ndx)"
+          test "$root" = "$(pwd -P)"
+          test "$current" = "$3"
+          test "$shallow" = true
+          test "$revisions" = 1
+          test -z "$remotes"
+          test -z "$changes"
+          test -z "$extras"
+          BASH
+          then
+            echo 'Candidate revision validation failed.'
+            exit 1
+          fi
+          echo 'Candidate authenticated and validated.'
+
+      - name: Android SDK
+        id: sdk
+        run: |
+          umask 077
+          sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          if [ ! -f "$sdk_root/platforms/android-36/android.jar" ] || [ ! -x "$sdk_root/build-tools/36.0.0/aapt2" ]; then
+            manager="$sdk_root/cmdline-tools/latest/bin/sdkmanager"
+            if [ ! -x "$manager" ]; then
+              manager="$(find "$sdk_root/cmdline-tools" -type f -name sdkmanager -print -quit 2>/dev/null)"
+            fi
+            test -x "$manager"
+            "$manager" --sdk_root="$sdk_root" 'platforms;android-36' 'build-tools;36.0.0' \
+              > "$RUNNER_TEMP/private-output/logs/sdk.log" 2>&1
+          fi
+          test -f "$sdk_root/platforms/android-36/android.jar"
+          test -x "$sdk_root/build-tools/36.0.0/aapt2"
+          printf '%s\n' "ANDROID_HOME=$sdk_root" >> "$GITHUB_ENV"
+
+      - name: Test web source and compile Android release sources
+        id: compile
+        run: |
+          umask 077
+          logs="$RUNNER_TEMP/private-output/logs"
+          private_run() {
+            local name="$1"
+            shift
+            local status=0
+            env -i PATH="$PATH" HOME="$RUNNER_TEMP/candidate-home" CI=true \
+              JAVA_HOME="$JAVA_HOME" ANDROID_HOME="$ANDROID_HOME" \
+              GRADLE_USER_HOME="$RUNNER_TEMP/candidate-home/.gradle" \
+              "$@" > "$logs/$name.log" 2>&1 || status=$?
+            printf '%s exit status %d\n' "$name" "$status"
+            return "$status"
+          }
+
+          repo="$RUNNER_TEMP/candidate"
+          cd "$repo"
+          private_run npm-install npm ci
+          private_run release-contract npm run release:check
+          private_run web-tests env NODE_OPTIONS=--test-reporter=tap npm test
+          node - "$logs/web-tests.log" "$RUNNER_TEMP/private-output/test-count.txt" <<'NODE'
+          const fs = require('node:fs');
+          const [log, output] = process.argv.slice(2);
+          const matches = [...fs.readFileSync(log, 'utf8').matchAll(/^# (tests|pass|fail|cancelled|skipped|todo) (\d+)\s*$/gm)];
+          const counts = new Map(matches.map(([, key, value]) => [key, Number(value)]));
+          if (matches.length !== 6 || counts.size !== 6 || counts.get('tests') <= 0 ||
+              counts.get('pass') !== counts.get('tests') ||
+              ['fail', 'cancelled', 'skipped', 'todo'].some(key => counts.get(key) !== 0)) {
+            console.error('Web test totals failed validation.');
+            process.exit(1);
+          }
+          fs.writeFileSync(output, String(counts.get('pass')) + '\n');
+          console.log('Web tests passed ' + counts.get('pass') + '/' + counts.get('tests'));
+          NODE
+          private_run build-web node scripts/build-web.cjs
+          private_run capacitor-sync node node_modules/@capacitor/cli/bin/capacitor sync android
+          cd android
+          private_run gradle-compile bash gradlew --no-daemon testReleaseUnitTest compileReleaseSources
+
+      - name: Build and verify APK when existing signing credentials are available
+        id: sign
+        env:
+          ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          umask 077
+          if [[ -z "$ANDROID_KEYSTORE_B64" || -z "$ANDROID_KEYSTORE_PASSWORD" || -z "$ANDROID_KEY_ALIAS" || -z "$ANDROID_KEY_PASSWORD" ]]; then
+            echo 'Signing credentials are unavailable. Compilation completed without an APK.'
+            echo 'produced=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          key_file="$RUNNER_TEMP/candidate-release.p12"
+          trap 'rm -f -- "$key_file"' EXIT
+          output="$RUNNER_TEMP/private-output"
+          printf '%s' "$ANDROID_KEYSTORE_B64" | base64 --decode > "$key_file" 2> "$output/logs/signing-key-decode.log"
+          chmod 600 "$key_file"
+          unset ANDROID_KEYSTORE_B64
+          private_run() {
+            local name="$1"
+            shift
+            local status=0
+            env -i PATH="$PATH" HOME="$RUNNER_TEMP/candidate-home" CI=true GITHUB_ACTIONS=true \
+              JAVA_HOME="$JAVA_HOME" ANDROID_HOME="$ANDROID_HOME" \
+              GRADLE_USER_HOME="$RUNNER_TEMP/candidate-home/.gradle" TEST_COUNT="$(cat "$output/test-count.txt")" \
+              ANDROID_KEYSTORE_PATH="$key_file" ANDROID_KEYSTORE_PASSWORD="$ANDROID_KEYSTORE_PASSWORD" \
+              ANDROID_KEY_ALIAS="$ANDROID_KEY_ALIAS" ANDROID_KEY_PASSWORD="$ANDROID_KEY_PASSWORD" \
+              "$@" > "$output/logs/$name.log" 2>&1 || status=$?
+            printf '%s exit status %d\n' "$name" "$status"
+            return "$status"
+          }
+          cd "$RUNNER_TEMP/candidate"
+          private_run signed-build npm run build:apk
+          private_run apk-verification python3 scripts/verify-apk.py
+          shopt -s nullglob
+          apks=(build/apk/*.apk)
+          test "${#apks[@]}" -eq 1
+          mkdir "$output/apk"
+          cp -- "${apks[0]}" "${apks[0]}.sha256" build/apk/{release-provenance,web-manifest}.json "$output/apk/"
+          echo 'produced=true' >> "$GITHUB_OUTPUT"
+          echo 'Signed APK and local asset manifest verified.'
+
+      - name: Seal receipt, logs and verified artifacts
+        if: always()
+        id: seal
+        env:
+          SOURCE_OUTCOME: ${{ steps.source.outcome }}
+          SDK_OUTCOME: ${{ steps.sdk.outcome }}
+          COMPILE_OUTCOME: ${{ steps.compile.outcome }}
+          SIGN_OUTCOME: ${{ steps.sign.outcome }}
+          APK_PRODUCED: ${{ steps.sign.outputs.produced }}
+        run: |
+          umask 077
+          output="$RUNNER_TEMP/private-output"
+          mkdir -p "$output/logs"
+          node - "$output" <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const output = process.argv[2];
+          const plan = require('./source-plan.json');
+          const countFile = path.join(output, 'test-count.txt');
+          const signedApkProduced = process.env.APK_PRODUCED === 'true';
+          const receipt = {
+            sourceCommit: plan.commit,
+            builder: 'github-actions',
+            runId: process.env.GITHUB_RUN_ID,
+            runAttempt: process.env.GITHUB_RUN_ATTEMPT,
+            source: process.env.SOURCE_OUTCOME,
+            sdk: process.env.SDK_OUTCOME,
+            compile: process.env.COMPILE_OUTCOME,
+            signing: process.env.SIGN_OUTCOME,
+            compileOnly: process.env.COMPILE_OUTCOME === 'success' && process.env.APK_PRODUCED === 'false',
+            signedApkProduced,
+            testsPassed: fs.existsSync(countFile) ? Number(fs.readFileSync(countFile, 'utf8')) : null,
+            deviceVerified: false,
+          };
+          if (!signedApkProduced) fs.rmSync(path.join(output, 'apk'), { recursive: true, force: true });
+          fs.writeFileSync(path.join(output, 'receipt.json'), JSON.stringify(receipt, null, 2) + '\n');
+          NODE
+          tar -czf "$RUNNER_TEMP/build-output.tar.gz" -C "$output" . 2> "$RUNNER_TEMP/bundle.log"
+          node sealed.cjs encrypt-output source-plan.json "$RUNNER_TEMP/build-output.tar.gz" "$RUNNER_TEMP/sealed-build-output.bin"
+          echo 'Encrypted build output prepared.'
+
+      - name: Clean private working files
+        if: always()
+        run: |
+          rm -rf -- "$RUNNER_TEMP/candidate" "$RUNNER_TEMP/candidate-home" "$RUNNER_TEMP/private-output"
+          rm -f -- "$RUNNER_TEMP/candidate-release.p12" "$RUNNER_TEMP/build-output.tar.gz" "$RUNNER_TEMP/source.sealed" "$RUNNER_TEMP/bundle.log"
+
+      - name: Retain only encrypted build output
+        if: always() && steps.seal.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sealed-build-output
+          path: ${{ runner.temp }}/sealed-build-output.bin
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
