@@ -1,6 +1,6 @@
 {
-  "commit": "2081cbcad25651b3111383896fd3a070845f57b1",
-  "payloadUrl": "https://github.com/gugu9999gu/pixelsmith-build/releases/download/input-2081cbc/source.tar.gz.sealed",
-  "payloadSha256": "b3dead9eb9f6852e9c9a4fbd06c873c87a416fdc8aa62a07f4dbe9cfaa7ec0a2",
+  "commit": "15c430e8c9033e73185da1dee4b1678e87ee1c90",
+  "payloadUrl": "https://github.com/gugu9999gu/pixelsmith-build/releases/download/input-v27-99f7706/signing-source.tar.gz.sealed",
+  "payloadSha256": "561821ecf749209e4b262ff36bcc44b63e23962c97a66bd044b660e2bfa07a66",
   "recipientPublicKey": "-----BEGIN PUBLIC KEY-----\nMIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEAvbFn43LJy9Fm6tuwQ6Is\nsdER0rnqwlrDkcT81Cs6i8zQVbg9Nr73KLhAGdcwYC8uRufrCm150V2kbvfX6lAA\nPnS7l1ssS6UPTXTPu7S5xc8TMw8JUPH9xzcYJgFtMVjjTEoc353+Lf2xy6iZjOdL\nSgjAQqJsD8MtUaeqQl9cj5F+O98lS41xICDeHPqfQ4VZkNorLEAiemSeW0y0tyTn\nh9oayM3XbHexLpW7LqR7DWf5WeUFa6Rpwl6W4rBZKKcURml94AAHVTXbdASk2GBo\nfbnVVJ1O1GXAotzuxZHWDpKyKzMKQ3yRiJok4KPRiFaR8xaGqgcnOVdzrsKGH2UR\nHkqJqTzU7tXAtybl58/TCL2RjbieMG5Cpj7MIvAcuqpufVasnWJkzG1ukZL8fzr2\nFQGalQPcBmaQFZPskJdjWz+3uQ/FnwfZHTZv7e2foIYbDA+/9qp/sG80upibBXhN\nefTMdJwr0S8zfKC7vGsP47jO48JiLW3TbT5mMgJKCqATAgMBAAE=\n-----END PUBLIC KEY-----\n"
 }
